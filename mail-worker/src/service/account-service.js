@@ -155,6 +155,12 @@ const accountService = {
 			throw new BizError(t('noUserAccount'));
 		}
 
+		const { syncDelete } = await settingService.query(c);
+		if (syncDelete === settingConst.syncDelete.OPEN) {
+			await this.physicsDelete(c, { accountId });
+			return;
+		}
+
 		await orm(c).update(account).set({ isDel: isDel.DELETE }).where(
 			and(eq(account.userId, userId),
 				eq(account.accountId, accountId)))
@@ -259,7 +265,6 @@ const accountService = {
 
 	async setAsTop(c, params, userId) {
 		const { accountId } = params;
-		console.log(accountId);
 		const userRow = await userService.selectById(c, userId);
 		const mainAccountRow = await accountService.selectByEmailIncludeDel(c, userRow.email);
 		let mainSort = mainAccountRow.sort === 0 ? 2 : mainAccountRow.sort + 1;
