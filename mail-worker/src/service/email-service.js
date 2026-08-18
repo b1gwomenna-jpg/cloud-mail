@@ -7,6 +7,7 @@ import settingService from './setting-service';
 import accountService from './account-service';
 import BizError from '../error/biz-error';
 import emailUtils from '../utils/email-utils';
+import fileUtils from '../utils/file-utils';
 import { Resend } from 'resend';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
@@ -136,6 +137,19 @@ const emailService = {
 	async delete(c, params, userId) {
 		const { emailIds } = params;
 		const emailIdList = emailIds.split(',').map(Number);
+		const { syncDelete } = await settingService.query(c);
+
+		if (syncDelete === settingConst.syncDelete.OPEN) {
+			const owned = await orm(c).select({ emailId: email.emailId }).from(email)
+				.where(and(eq(email.userId, userId), inArray(email.emailId, emailIdList)))
+				.all();
+			const ownedIds = owned.map(row => row.emailId);
+			if (ownedIds.length) {
+				await this.physicsDelete(c, { emailIds: ownedIds.join(',') });
+			}
+			return;
+		}
+
 		await orm(c).update(email).set({ isDel: isDel.DELETE }).where(
 			and(
 				eq(email.userId, userId),
@@ -160,7 +174,7 @@ const emailService = {
 			text, //邮件纯文本
 			content, //邮件内容
 			subject, //邮件标题
-			attachments //附件
+			attachments = [] //附件
 		} = params;
 
 		const { resendTokens, r2Domain, send, domainList } = await settingService.query(c);
@@ -230,10 +244,11 @@ const emailService = {
 
 		const domain = emailUtils.getDomain(accountRow.email);
 		const resendToken = resendTokens[domain];
+		const useCloudflareEmail = !!c.env.email;
 
-		//如果接收方存在站外邮箱，又没有resend token
-		if (!resendToken && !allInternal) {
-			throw new BizError(t('noResendToken'));
+		//如果接收方存在站外邮箱，又没有发信服务
+		if (!useCloudflareEmail && !resendToken && !allInternal) {
+			throw new BizError(t('noSendProvider'));
 		}
 
 		//没有发件人名字自动截取
@@ -256,34 +271,40 @@ const emailService = {
 
 		}
 
-		let resendResult = {};
+		let sendResult = {};
 
-		//存在站外时邮箱全部由resend发送
+		//存在站外邮箱时，如果配置了 Cloudflare Email Service 就优先使用，否则使用 Resend
 		if (!allInternal) {
 
-			const resend = new Resend(resendToken);
-
-			const sendForm = {
-				from: `${name} <${accountRow.email}>`,
-				to: [...receiveEmail],
-				subject: subject,
-				text: text,
-				html: html,
-				attachments: [...imageDataList, ...attachments]
-			};
-
-			if (sendType === 'reply') {
-				sendForm.headers = {
-					'in-reply-to': emailRow.messageId,
-					'references': emailRow.messageId
-				};
+			if (useCloudflareEmail) {
+				sendResult = await this.sendByCloudflareEmail(c, {
+					name,
+					accountEmail: accountRow.email,
+					receiveEmail,
+					subject,
+					text,
+					html,
+					attachments: [...imageDataList, ...attachments],
+					sendType,
+					messageId: emailRow.messageId
+				});
+			} else {
+				sendResult = await this.sendByResend(resendToken, {
+					name,
+					accountEmail: accountRow.email,
+					receiveEmail,
+					subject,
+					text,
+					html,
+					attachments: [...imageDataList, ...attachments],
+					sendType,
+					messageId: emailRow.messageId
+				});
 			}
-
-			resendResult = await resend.emails.send(sendForm);
 
 		}
 
-		const { data, error } = resendResult;
+		const { data, error } = sendResult;
 
 
 		if (error) {
@@ -303,7 +324,7 @@ const emailService = {
 		emailData.content = html;
 		emailData.text = text;
 		emailData.accountId = accountId;
-		emailData.status = emailConst.status.SENT;
+		emailData.status = useCloudflareEmail ? emailConst.status.DELIVERED : emailConst.status.SENT;
 		emailData.type = emailConst.type.SEND;
 		emailData.userId = userId;
 		emailData.resendEmailId = data?.id;
@@ -365,6 +386,171 @@ const emailService = {
 		}
 
 		return [ emailResult ];
+	},
+
+	async sendByCloudflareEmail(c, params) {
+		const sendForm = {
+			from: { email: params.accountEmail, name: params.name },
+			to: [...params.receiveEmail],
+			subject: params.subject
+		};
+
+		if (params.text) {
+			sendForm.text = params.text;
+		}
+
+		if (params.html) {
+			sendForm.html = params.html;
+		}
+
+		const attachments = await this.toCloudflareAttachments(params.attachments);
+		if (attachments.length > 0) {
+			sendForm.attachments = attachments;
+		}
+
+		if (params.sendType === 'reply' && params.messageId) {
+			sendForm.headers = {
+				'in-reply-to': params.messageId,
+				'references': params.messageId
+			};
+		}
+
+		const result = await c.env.email.send(sendForm);
+
+		return {
+			data: {
+				id: result.messageId
+			}
+		};
+	},
+
+	async sendByResend(resendToken, params) {
+		const resend = new Resend(resendToken);
+
+		const sendForm = {
+			from: `${params.name} <${params.accountEmail}>`,
+			to: [...params.receiveEmail],
+			subject: params.subject,
+			text: params.text,
+			html: params.html,
+			attachments: await this.toResendAttachments(params.attachments)
+		};
+
+		if (params.sendType === 'reply') {
+			sendForm.headers = {
+				'in-reply-to': params.messageId,
+				'references': params.messageId
+			};
+		}
+
+		return await resend.emails.send(sendForm);
+	},
+
+	async toCloudflareAttachments(attachments) {
+		const arrayBufferAttachments = await this.toArrayBufferAttachments(attachments);
+
+		return arrayBufferAttachments.map(attachment => {
+			const item = {
+				content: attachment.content,
+				filename: attachment.filename,
+				type: attachment.mimeType || attachment.contentType || attachment.type || 'application/octet-stream',
+				disposition: attachment.contentId ? 'inline' : 'attachment'
+			};
+
+			if (attachment.contentId) {
+				item.contentId = attachment.contentId.replace(/^<|>$/g, '');
+			}
+
+			return item;
+		});
+	},
+
+	async toResendAttachments(attachments = []) {
+		const result = [];
+
+		for (const attachment of attachments) {
+			const content = await this.toAttachmentBase64(attachment);
+			if (!content) {
+				continue;
+			}
+
+			result.push({
+				...attachment,
+				content,
+				contentType: attachment.contentType || attachment.mimeType || attachment.type || 'application/octet-stream'
+			});
+		}
+
+		return result;
+	},
+
+	async toArrayBufferAttachments(attachments = []) {
+		const result = [];
+
+		for (const attachment of attachments) {
+			const content = await this.toAttachmentArrayBuffer(attachment);
+			if (!content) {
+				continue;
+			}
+
+			result.push({ ...attachment, content });
+		}
+
+		return result;
+	},
+
+	async toAttachmentBase64(attachment) {
+		let content = attachment.content;
+
+		if (!content) {
+			return null;
+		}
+
+		if (typeof content === 'string') {
+			if (content.startsWith('data:')) {
+				content = content.split(',')[1] || content;
+			}
+			return content.replace(/\s+/g, '');
+		}
+
+		const arrayBuffer = await this.toAttachmentArrayBuffer(attachment);
+		if (!arrayBuffer) {
+			return null;
+		}
+
+		const bytes = new Uint8Array(arrayBuffer);
+		let binary = '';
+
+		for (let i = 0; i < bytes.length; i += 0x8000) {
+			binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+		}
+
+		return btoa(binary);
+	},
+
+	async toAttachmentArrayBuffer(attachment) {
+		let content = attachment.content;
+
+		if (!content) {
+			return null;
+		}
+
+		if (content instanceof ArrayBuffer) {
+			return content;
+		}
+
+		if (content instanceof Uint8Array) {
+			return content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength);
+		}
+
+		if (typeof content === 'string') {
+			if (content.startsWith('data:')) {
+				content = content.split(',')[1] || content;
+			}
+			return fileUtils.base64ToUint8Array(content.replace(/\s+/g, '')).buffer;
+		}
+
+		return content;
 	},
 
 	//处理站内邮件发送
@@ -684,9 +870,9 @@ const emailService = {
 			query.orderBy(desc(email.emailId));
 		}
 
-		const listQuery = await query.limit(size).all();
-		const totalQuery = await queryCount.get();
-		const latestEmailQuery = await orm(c).select().from(email)
+		const listQuery = query.limit(size).all();
+		const totalQuery = queryCount.get();
+		const latestEmailQuery = orm(c).select().from(email)
 			.where(and(
 				eq(email.type, emailConst.type.RECEIVE),
 				ne(email.status, emailConst.status.SAVING)

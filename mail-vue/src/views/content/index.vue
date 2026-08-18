@@ -112,11 +112,22 @@ onMounted(() => {
     email.unread = EmailUnreadEnum.READ;
     emailRead([email.emailId]);
   }
+  window.addEventListener('keydown', handleKeyDown);
 })
 
 onUnmounted(() => {
   emailStore.contentData.showUnread = false;
+  window.removeEventListener('keydown', handleKeyDown);
 })
+
+function handleKeyDown(event) {
+  if (event.key !== 'Escape') return;
+  if (showPreview.value) return;
+  if (document.querySelector('.el-message-box')) return;
+  const writeBox = document.querySelector('.write-box');
+  if (writeBox && writeBox.offsetParent !== null) return;
+  handleBack();
+}
 
 function openReply() {
   uiStore.writerRef.openReply(email)
@@ -221,7 +232,7 @@ const handleDelete = () => {
 }
 
 .header-actions {
-  padding: 9px 15px;
+  padding: 9px 15px 8px;
   display: flex;
   align-items: center;
   gap: 20px;

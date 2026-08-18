@@ -15,7 +15,7 @@ const starService = {
 		if (!email) {
 			throw new BizError(t('starNotExistEmail'));
 		}
-		if (!email.userId === userId) {
+		if (email.userId !== userId) {
 			throw new BizError(t('starNotExistEmail'));
 		}
 		const exist = await orm(c).select().from(star).where(
@@ -77,6 +77,10 @@ const starService = {
 	},
 	async removeByEmailIds(c, emailIds) {
 		await orm(c).delete(star).where(inArray(star.emailId, emailIds)).run();
+	},
+
+	async removeByUserIds(c, userIds) {
+		await orm(c).delete(star).where(inArray(star.userId, userIds)).run();
 	}
 };
 
